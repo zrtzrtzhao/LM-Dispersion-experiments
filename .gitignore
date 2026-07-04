@@ -1,0 +1,69 @@
+# Editor / OS
+.vscode/
+**/.DS_Store
+
+# Python
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+conda_envs/
+env.sh
+
+# Secrets and local credentials
+.env
+.env.*
+*token*
+*credentials*
+
+# Hugging Face / dataset caches
+.cache/
+cache/
+hf_cache/
+model_cache/
+data/
+datasets/
+**/*.arrow
+
+# Experiment outputs
+**/results/
+**/results_old/
+**/figures/
+**/tables/
+**/visualization/
+**/slurm_out/
+wandb/
+eval_log.txt
+*.out
+*.log
+*.old
+
+# Checkpoints and model weights
+**/checkpoint*/
+**/eval_ckpt*/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.pth.tar
+**/*.bin
+**/*.safetensors
+**/*.pkl
+
+# Generated arrays / metrics / evaluation artifacts
+**/*.npy
+**/*.npz
+**/lm_eval_*.json
+**/*metrics*.json
+**/*results*.csv
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
