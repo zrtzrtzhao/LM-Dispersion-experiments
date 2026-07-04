@@ -92,6 +92,8 @@ if __name__ == '__main__':
     runs = []
     baseline_idx = None
     for run_folder in run_folder_list:
+        if 'disp-' not in os.path.basename(run_folder):
+            continue
         d, c, l = parse_run_triplet(run_folder)
         # NOTE: Temporary hack.
         if float(c) > 1:
