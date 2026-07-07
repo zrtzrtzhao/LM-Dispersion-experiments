@@ -6,8 +6,9 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer, AutoModel
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 import tempfile
+import re
 
 import_dir = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 sys.path.insert(0, os.path.join(import_dir, 'key_observations'))
@@ -45,10 +46,17 @@ def build_hist_stack(cossim_matrix_by_layer: List[np.ndarray], step: int = 1, bi
     return np.array(hist_data), layer_indices
 
 def parse_run_triplet(run_folder: str):
-    dispersion = run_folder.split('disp-')[1].split('-')[0]
-    dispersion_coeff = run_folder.split(f'{dispersion}-')[1].split('-')[0]
-    dispersion_loc = run_folder.split(f'{dispersion_coeff}-')[1].split('_')[0]
-    return dispersion, dispersion_coeff, dispersion_loc
+    name = os.path.basename(run_folder)
+    match = re.search(r'_disp-(?P<disp>.+?)-(?P<coeff>[^-]+)-(?P<loc>[^_]+)', name)
+    if match is None:
+        raise ValueError(f'Could not parse dispersion settings from: {run_folder}')
+    return match.group('disp'), match.group('coeff'), match.group('loc')
+
+def parse_train_tokens(run_folder: str):
+    match = re.search(r'_token-(\d+)_', os.path.basename(run_folder))
+    if match is None:
+        return None
+    return int(match.group(1))
 
 def find_checkpoints(run_folder: str):
     ckpt_dirs = glob(os.path.join(run_folder, 'eval_ckpt_*_step*'))
@@ -74,6 +82,21 @@ def coeff_key(x):
         return float(x)
     except:
         return np.inf
+
+def mark_failed_axis(ax, title, message):
+    ax.set_title(title, fontsize=24)
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        ha='center',
+        va='center',
+        transform=ax.transAxes,
+        fontsize=18,
+        wrap=True,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 if __name__ == '__main__':
@@ -106,20 +129,31 @@ if __name__ == '__main__':
         raise RuntimeError('No baseline run found with dispersion == None.')
 
     baseline_run = runs[baseline_idx]
+    baseline_tokens = parse_train_tokens(baseline_run[0])
     others = runs[:baseline_idx] + runs[baseline_idx+1:]
     # order_disp = ["decorrelation", "l2_repel", "angular_spread", "orthogonalization"]
     order_disp = ["angular_spread"]
 
     for disp in order_disp:
         group = [r for r in others if r[1] == disp]
-        group.sort(key=lambda r: coeff_key(r[2]))
-        if len(group) == 0:
+        group_with_ckpts = [r for r in group if len(find_checkpoints(r[0])) > 0]
+        if baseline_tokens is not None:
+            same_token_group = [r for r in group_with_ckpts if parse_train_tokens(r[0]) == baseline_tokens]
+            if same_token_group:
+                group_with_ckpts = same_token_group
+        group_with_ckpts.sort(key=lambda r: (coeff_key(r[2]), r[0]))
+        if len(group_with_ckpts) == 0:
+            print(f'[Heatmap] No {disp} run with eval checkpoints found.')
             continue
 
-        runs_in_fig = [baseline_run] + group
+        runs_in_fig = [baseline_run] + group_with_ckpts
 
         # NOTE: Just plot the final iteration
         runs_in_fig = runs_in_fig[:1] + runs_in_fig[-1:]
+        print('\n[Heatmap] Selected runs:')
+        for i, (run_folder, d, c, l) in enumerate(runs_in_fig):
+            print(f'  row {i}: {run_label(d, c, l)}')
+            print(f'    {run_folder}')
 
         ckpt_lists = []
         max_ckpts = 0
@@ -127,6 +161,9 @@ if __name__ == '__main__':
             ckpts = find_checkpoints(run_folder)
             ckpts = ckpts[::ckpt_stride]
             ckpt_lists.append(ckpts)
+            print(f'[Heatmap] {run_label(d, c, l)} checkpoints: {len(ckpts)}')
+            for step, ckpt_path in ckpts:
+                print(f'  step {step}: {ckpt_path}')
 
             if len(ckpts) > max_ckpts:
                 max_ckpts = len(ckpts)
@@ -140,19 +177,28 @@ if __name__ == '__main__':
                 ax.spines['right'].set_visible(False)
 
                 if col_idx >= len(ckpts):
-                    ax.axis('off')
+                    mark_failed_axis(ax, run_label(d, c, l), 'No checkpoint for this column')
                     continue
 
                 step, ckpt_path = ckpts[col_idx]
+                label = run_label(d, c, l)
 
                 with tempfile.TemporaryDirectory() as tmp_cache:
-                    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, cache_dir=tmp_cache)
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(ckpt_path, cache_dir=tmp_cache)
+                    except Exception as e:
+                        print(f"[Heatmap] Failed to load tokenizer: {ckpt_path}")
+                        print(repr(e))
+                        mark_failed_axis(ax, f'{label}\nstep {step}', 'Tokenizer load failed')
+                        continue
 
                     try:
                         config = AutoConfig.from_pretrained(ckpt_path, cache_dir=tmp_cache)
-                        model = AutoModel.from_pretrained(ckpt_path, config=config, cache_dir=tmp_cache)
-                    except Exception:
-                        ax.axis('off')
+                        model = AutoModelForCausalLM.from_pretrained(ckpt_path, config=config, cache_dir=tmp_cache)
+                    except Exception as e:
+                        print(f"[Heatmap] Failed to load checkpoint: {ckpt_path}")
+                        print(repr(e))
+                        mark_failed_axis(ax, f'{label}\nstep {step}', 'Model load failed')
                         continue
 
                     model.to(device)
@@ -186,13 +232,13 @@ if __name__ == '__main__':
 
                     hist_matrix, layer_indices = build_hist_stack(cossim_matrix_by_layer)
                     if hist_matrix.size == 0:
-                        ax.axis('off')
+                        mark_failed_axis(ax, f'{label}\nstep {step}', 'Empty histogram')
                     else:
                         im = ax.imshow(hist_matrix.T, aspect="auto", origin="lower", cmap='Reds',
                            extent=[0, layer_indices[-1], -1, 1], vmin=0, vmax=10)
 
-                        ax.set_title(f'step {step}', pad=24,
-                                     fontfamily='monospace', fontname='cmtt10', fontsize=54)
+                        ax.set_title(f'{label}\nstep {step}', pad=24,
+                                     fontfamily='monospace', fontname='cmtt10', fontsize=40)
                         ax.set_xlabel('Layer Fraction', fontsize=54)
                         ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1])
                         ax.set_xticklabels([0, 0.2, 0.4, 0.6, 0.8, 1])
@@ -209,9 +255,8 @@ if __name__ == '__main__':
                     del model
                     if device == 'cuda':
                         torch.cuda.empty_cache()
-
-                fig.tight_layout(pad=2)
-                fig.savefig(f'{figure_save_prefix}_{disp}.png', dpi=300)
+        fig.tight_layout(pad=2)
+        fig.savefig(f'{figure_save_prefix}_{disp}.png', dpi=300)
 
         plt.close(fig)
 
