@@ -1,12 +1,3 @@
-"""
-Mid-train GPT-2 with Version C SFA-CE.
-
-This script keeps the normal causal-LM forward path unchanged. During training
-only, it computes an auxiliary CE loss from final hidden states after suppressing
-their dominant spectral direction with one-step incomplete power iteration.
-Inference and lm-eval use the unmodified model.
-"""
-
 from typing import List, Optional
 import os
 import gc
@@ -321,13 +312,12 @@ class CustomLossTrainer(Trainer):
                  tau_l2: float,
                  tau_cos: float,
                  clamp_threshold: float,
-                 sfa_ce: bool,
-                 sfa_ce_coeff: float,
-                 sfa_ce_loc: str,
-                 sfa_strength: float,
-                 sfa_iterations: int,
+                 sfa_peak: bool,
+                 sfa_peak_coeff: float,
+                 sfa_peak_loc: str,
+                 sfa_peak_iterations: int,
                  sfa_token_sample: int,
-                 sfa_rescale_norm: bool,
+                 sfa_normalize_rows: bool,
                  sfa_epsilon: float,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -341,117 +331,86 @@ class CustomLossTrainer(Trainer):
             variant = dispersion.lower()
             self.disp_loss_fn = DispersionLoss(variant=variant,
                                                tau_l2=tau_l2,
-                                               tau_cos=tau_cos,
-                                               clamp_threshold=clamp_threshold)
+                                               tau_cos=tau_cos)
 
-        self.use_sfa_ce = bool(sfa_ce) and sfa_ce_coeff > 0.0
-        self.sfa_ce_coeff = float(sfa_ce_coeff)
-        self.sfa_ce_loc = sfa_ce_loc
-        self.sfa_strength = float(sfa_strength)
-        self.sfa_iterations = int(sfa_iterations)
+        self.clamp_threshold = clamp_threshold
+        self.use_sfa_peak = bool(sfa_peak) and sfa_peak_coeff > 0.0
+        self.sfa_peak_coeff = float(sfa_peak_coeff)
+        self.sfa_peak_loc = sfa_peak_loc
+        self.sfa_peak_iterations = int(sfa_peak_iterations)
         self.sfa_token_sample = int(sfa_token_sample)
-        self.sfa_rescale_norm = bool(sfa_rescale_norm)
+        self.sfa_normalize_rows = bool(sfa_normalize_rows)
         self.sfa_epsilon = float(sfa_epsilon)
 
-    @staticmethod
-    def _unwrap_model(model):
-        return model.module if hasattr(model, "module") else model
+    def _valid_prediction_mask(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden.shape
+        if attention_mask is not None:
+            valid = attention_mask.to(device=hidden.device).bool()
+        else:
+            valid = torch.ones(bsz, seq_len, device=hidden.device, dtype=torch.bool)
 
-    def _apply_sfa_to_hidden(
+        if labels is not None:
+            # Causal LM hidden[:, :-1] predicts labels[:, 1:].
+            valid = valid.clone()
+            valid[:, :-1] = valid[:, :-1] & labels[:, 1:].ne(-100).to(device=hidden.device)
+            valid[:, -1] = False
+        return valid
+
+    def _sfa_peak_loss_one_layer(
         self,
         hidden: torch.Tensor,
         labels: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
-        Version C: estimate one dominant spectral direction from row-normalized
-        hidden states, then suppress that direction in the raw hidden states.
-        The auxiliary CE is computed on the full SFA-perturbed hidden states.
+        Penalize the approximate top spectral energy ratio of each sequence:
+        ||H r||_2^2 / ||H||_F^2, with r estimated by a few power iterations.
         """
-        if self.sfa_strength == 0.0 or hidden.size(-1) < 2:
-            return hidden
+        if hidden.size(-1) < 2:
+            return hidden.new_zeros(())
 
-        bsz, seq_len, dim = hidden.shape
-        flat_hidden = hidden.reshape(bsz * seq_len, dim)
+        valid = self._valid_prediction_mask(hidden, labels, attention_mask)
+        seq_losses = []
 
-        if attention_mask is not None:
-            valid = attention_mask.to(device=hidden.device).bool()
-        else:
-            valid = torch.ones(bsz, seq_len, device=hidden.device, dtype=torch.bool)
-        if labels is not None:
-            # Causal LM uses hidden[:, :-1] to predict labels[:, 1:].
-            # Estimate the SFA direction from hidden positions that actually
-            # contribute to the auxiliary CE loss.
-            valid = valid.clone()
-            valid[:, :-1] = valid[:, :-1] & labels[:, 1:].ne(-100).to(device=hidden.device)
-            valid[:, -1] = False
-        valid = valid.reshape(-1)
+        for seq_hidden, seq_valid in zip(hidden, valid):
+            idx = torch.nonzero(seq_valid, as_tuple=False).flatten()
+            if idx.numel() < 2:
+                continue
 
-        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
-        if valid_idx.numel() < 2:
-            return hidden
+            if self.sfa_token_sample > 0 and idx.numel() > self.sfa_token_sample:
+                perm = torch.randperm(idx.numel(), device=hidden.device)[: self.sfa_token_sample]
+                idx = idx[perm]
 
-        if self.sfa_token_sample > 0 and valid_idx.numel() > self.sfa_token_sample:
-            perm = torch.randperm(valid_idx.numel(), device=hidden.device)[: self.sfa_token_sample]
-            power_idx = valid_idx[perm]
-        else:
-            power_idx = valid_idx
+            h = seq_hidden.index_select(0, idx).float()
+            if self.sfa_normalize_rows:
+                h = torch.nn.functional.normalize(h, p=2, dim=-1, eps=self.sfa_epsilon)
 
-        power_hidden = flat_hidden.index_select(0, power_idx).float()
-        power_hidden = torch.nn.functional.normalize(power_hidden, p=2, dim=-1, eps=self.sfa_epsilon)
+            denom = h.pow(2).sum().clamp_min(self.sfa_epsilon)
+            r = h.mean(dim=0)
+            if r.pow(2).sum().item() <= self.sfa_epsilon:
+                r = torch.randn(h.size(-1), device=h.device, dtype=h.dtype)
 
-        r = torch.randn(dim, device=hidden.device, dtype=power_hidden.dtype)
-        for _ in range(max(0, self.sfa_iterations)):
-            hr = torch.matmul(power_hidden, r)
-            r = torch.matmul(power_hidden.transpose(0, 1), hr)
+            for _ in range(max(0, self.sfa_peak_iterations)):
+                hr = torch.matmul(h, r)
+                r = torch.matmul(h.transpose(0, 1), hr)
+                r = torch.nn.functional.normalize(r, p=2, dim=0, eps=self.sfa_epsilon)
 
-        norm_sq = r.pow(2).sum().clamp_min(self.sfa_epsilon)
-        flat_float = flat_hidden.float()
-        projection = torch.matmul(flat_float, r).unsqueeze(-1) * (r / norm_sq).unsqueeze(0)
-        sfa_flat = flat_float - self.sfa_strength * projection
+            r = torch.nn.functional.normalize(r, p=2, dim=0, eps=self.sfa_epsilon)
+            top_energy = torch.matmul(h, r).pow(2).sum()
+            seq_losses.append(top_energy / denom)
 
-        if self.sfa_rescale_norm:
-            old_norm = flat_float.norm(p="fro").clamp_min(self.sfa_epsilon)
-            new_norm = sfa_flat.norm(p="fro").clamp_min(self.sfa_epsilon)
-            sfa_flat = sfa_flat * (old_norm / new_norm)
-
-        return sfa_flat.to(dtype=hidden.dtype).reshape_as(hidden)
-
-    def select_sfa_ce_hidden_states(self, hidden_states: List[torch.Tensor]) -> List[torch.Tensor]:
-        loc = self.sfa_ce_loc.lower()
-        if loc == "last":
-            return [hidden_states[-1]]
-
-        assert len(hidden_states) > 1
-        tr_indices = list(range(1, len(hidden_states)))
-        n_tr = len(tr_indices)
-        mid = n_tr // 2
-
-        if loc == "early_half":
-            sel = tr_indices[:mid] if mid > 0 else tr_indices[:1]
-        elif loc == "late_half":
-            sel = tr_indices[mid:] if mid < n_tr else tr_indices[-1:]
-        else:
-            sel = tr_indices
-
-        return [hidden_states[i] for i in sel]
-
-    def _lm_head_logits(self, model, hidden: torch.Tensor) -> torch.Tensor:
-        m = self._unwrap_model(model)
-        lm_head = m.get_output_embeddings()
-        if lm_head is None:
-            lm_head = getattr(m, "lm_head", None)
-        if lm_head is None:
-            raise ValueError("Cannot find LM head via get_output_embeddings() or model.lm_head.")
-        logits = lm_head(hidden)
-        final_bias = getattr(m, "final_logits_bias", None)
-        if final_bias is not None:
-            logits = logits + final_bias
-        return logits
+        if not seq_losses:
+            return hidden.new_zeros(())
+        return torch.stack(seq_losses).mean().to(dtype=hidden.dtype)
 
     def disperse_hidden_states(self, hidden_states: List[torch.Tensor]) -> torch.Tensor:
         '''
-        Computes dispersion for last layer or averages across transformer layers (excluding emb at index 0).
+        Computes dispersion for selected transformer layers, excluding the embedding state at index 0.
         hidden_states: tuple of tensors, each [B, seq_len, feature_dim]
         '''
         loc = self.disp_loc.lower()
@@ -459,31 +418,55 @@ class CustomLossTrainer(Trainer):
             return self.disp_loss_fn(hidden_states[-1])
 
         assert len(hidden_states) > 1
-        # Transformer block outputs: indices 1 .. len-1 (skip embedding at 0)
         tr_indices = list(range(1, len(hidden_states)))
         n_tr = len(tr_indices)
         mid = n_tr // 2
 
         if loc == "early_half":
-            # First floor(n_tr/2) transformer layers; if only one layer, use it
             sel = tr_indices[:mid] if mid > 0 else tr_indices[:1]
         elif loc == "late_half":
-            # Remaining transformer layers; if only one layer, use it
             sel = tr_indices[mid:] if mid < n_tr else tr_indices[-1:]
         else:
-            # "all" and legacy defaults: every transformer layer
             sel = tr_indices
 
         loss_values = [self.disp_loss_fn(hidden_states[i]) for i in sel]
         return torch.stack(loss_values).mean()
 
+    def sfa_peak_hidden_states(
+        self,
+        hidden_states: List[torch.Tensor],
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        loc = self.sfa_peak_loc.lower()
+        if loc == "last":
+            return self._sfa_peak_loss_one_layer(hidden_states[-1], labels, attention_mask)
+
+        assert len(hidden_states) > 1
+        tr_indices = list(range(1, len(hidden_states)))
+        n_tr = len(tr_indices)
+        mid = n_tr // 2
+
+        if loc == "early_half":
+            sel = tr_indices[:mid] if mid > 0 else tr_indices[:1]
+        elif loc == "late_half":
+            sel = tr_indices[mid:] if mid < n_tr else tr_indices[-1:]
+        else:
+            sel = tr_indices
+
+        loss_values = [
+            self._sfa_peak_loss_one_layer(hidden_states[i], labels, attention_mask)
+            for i in sel
+        ]
+        return torch.stack(loss_values).mean()
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs["labels"]
 
-        # Hidden states are needed only for training-time geometry objectives.
+        # Use hidden states only for training-time geometry objectives.
         want_disp = self.use_disp and model.training
-        want_sfa_ce = self.use_sfa_ce and model.training
-        want_hidden = want_disp or want_sfa_ce
+        want_sfa_peak = self.use_sfa_peak and model.training
+        want_hidden = want_disp or want_sfa_peak
         outputs = model(**inputs, output_hidden_states=want_hidden)
         logits = outputs.logits
 
@@ -498,21 +481,16 @@ class CustomLossTrainer(Trainer):
         else:
             disp_loss = torch.zeros_like(default_loss)
 
-        if want_sfa_ce:
-            sfa_ce_losses = []
-            for hidden in self.select_sfa_ce_hidden_states(outputs.hidden_states):
-                z_sfa = self._apply_sfa_to_hidden(
-                    hidden,
-                    labels=labels,
-                    attention_mask=inputs.get("attention_mask"),
-                )
-                sfa_logits = self._lm_head_logits(model, z_sfa)
-                sfa_ce_losses.append(self.loss_fn(sfa_logits, labels))
-            sfa_ce_loss = torch.stack(sfa_ce_losses).mean()
-            total_loss = total_loss + self.sfa_ce_coeff * sfa_ce_loss
-            outputs.sfa_ce_loss = sfa_ce_loss.detach()
+        if want_sfa_peak:
+            sfa_peak_loss = self.sfa_peak_hidden_states(
+                outputs.hidden_states,
+                labels=labels,
+                attention_mask=inputs.get("attention_mask"),
+            )
+            total_loss = total_loss + self.sfa_peak_coeff * sfa_peak_loss
+            outputs.sfa_peak_loss = sfa_peak_loss.detach()
         else:
-            sfa_ce_loss = torch.zeros_like(default_loss)
+            sfa_peak_loss = torch.zeros_like(default_loss)
 
         if (model.training and
             self.state.global_step > 0 and
@@ -520,7 +498,7 @@ class CustomLossTrainer(Trainer):
 
             custom_losses = {
                 "train/dispersion_loss": disp_loss.detach().item(),
-                "train/sfa_ce_loss": sfa_ce_loss.detach().item(),
+                "train/sfa_peak_loss": sfa_peak_loss.detach().item(),
                 "train/default_loss": default_loss.detach().item(),
                 "train/total_loss": total_loss.detach().item(),
             }
@@ -554,12 +532,14 @@ def main(args):
     config = AutoConfig.from_pretrained(args.model_name, token=args.hf_token, cache_dir=args.cache_dir)
     if hasattr(config, "loss_type"):
         delattr(config, "loss_type")
+    config.use_cache = False
     model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config, token=args.hf_token, cache_dir=args.cache_dir)
+    model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
     max_position_embeddings = getattr(model.config, "max_position_embeddings")
-    context_len = 1024
-    max_gen_tokens = 256
+    context_len = args.context_len
+    max_gen_tokens = args.max_gen_tokens
     assert max_gen_tokens <= context_len and context_len <= max_position_embeddings
     tokenizer.model_max_length = context_len
 
@@ -644,17 +624,16 @@ def main(args):
         tau_cos=args.tau_cos,
         tau_l2=args.tau_l2,
         clamp_threshold=args.clamp_threshold,
-        sfa_ce=args.sfa_ce,
-        sfa_ce_coeff=args.sfa_ce_coeff,
-        sfa_ce_loc=args.sfa_ce_loc,
-        sfa_strength=args.sfa_strength,
-        sfa_iterations=args.sfa_iterations,
+        sfa_peak=args.sfa_peak,
+        sfa_peak_coeff=args.sfa_peak_coeff,
+        sfa_peak_loc=args.sfa_peak_loc,
+        sfa_peak_iterations=args.sfa_peak_iterations,
         sfa_token_sample=args.sfa_token_sample,
-        sfa_rescale_norm=args.sfa_rescale_norm,
+        sfa_normalize_rows=args.sfa_normalize_rows,
         sfa_epsilon=args.sfa_epsilon,
         train_dataset=lm_train,
         eval_dataset=lm_val,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=data_collator,
     )
 
@@ -668,9 +647,9 @@ def main(args):
     log(f"Token budget: {args.train_tokens} | Tokens/step: {tokens_per_step} | Max steps: {max_steps}", filepath=args.log_path)
     log(f"Precision: {'bf16' if bf16 else ('fp16' if fp16 else 'fp32')}", filepath=args.log_path)
     log(
-        f"SFA-CE: enabled={args.sfa_ce} | coeff={args.sfa_ce_coeff} | "
-        f"loc={args.sfa_ce_loc} | k={args.sfa_iterations} | strength={args.sfa_strength} | "
-        f"token_sample={args.sfa_token_sample} | rescale_norm={args.sfa_rescale_norm}",
+        f"SFA-Peak: enabled={args.sfa_peak} | coeff={args.sfa_peak_coeff} | "
+        f"loc={args.sfa_peak_loc} | k={args.sfa_peak_iterations} | "
+        f"token_sample={args.sfa_token_sample} | normalize_rows={args.sfa_normalize_rows}",
         filepath=args.log_path,
     )
 
@@ -682,17 +661,13 @@ def main(args):
         "openbookqa",
         "paloma_wikitext_103",
         "piqa",
-        # "squad_completion",
         "truthfulqa_mc2",
         "winogrande",
     ]
     fewshot_tasks = [
         "arc_challenge",
         "arc_easy",
-        # "drop",
-        # "gsm8k",
         "mmlu",
-        # "mmlu_pro",  # MMLU-Pro is too slow.
         "medmcqa",
     ]
     lm_eval_callback = LMEvalCallback(
@@ -710,15 +685,9 @@ def main(args):
     )
     trainer.add_callback(lm_eval_callback)
 
-    torch.cuda.reset_peak_memory_stats()
-
     train_t0 = time.perf_counter()
     trainer.train()
     train_elapsed = time.perf_counter() - train_t0
-
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
-    log(f"Peak memory: {peak_gb:.2f} GB", filepath=args.log_path)
-
     if int(os.environ.get("LOCAL_RANK", "0")) == 0:
         eval_sec = lm_eval_callback.eval_wall_seconds
         train_wo_eval = max(0.0, train_elapsed - eval_sec)
@@ -738,8 +707,8 @@ def main(args):
     log(f"Done. Saved to {args.output_dir}", filepath=args.log_path)
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Mid-train GPT-2 with Version C SFA-CE auxiliary loss.")
-    ap.add_argument("--model_name", type=str, default="gpt2",
+    ap = argparse.ArgumentParser(description="Mid-train Qwen3 with dispersion and optional SFA-Peak.")
+    ap.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B",
                     help="Hugging Face model id to start from (pretrained).")
     ap.add_argument("--lora", action="store_true", help="Use LoRA (Low-Rank Adaptation) instead of full fine-tuning")
     ap.add_argument("--cache_dir", type=str, default='./.cache/')
@@ -753,51 +722,55 @@ if __name__ == "__main__":
                     help="Learning rate. Please set this assuming number of GPU is 1. We will scale accordingly.")
     ap.add_argument("--train_tokens", type=int, required=True,
                     help="Total number of tokens to train on (token budget).")
+    ap.add_argument("--context_len", type=int, default=4096,
+                    help="Training sequence length. Use 2048 or 1024 if SFA-Peak OOMs.")
+    ap.add_argument("--max_gen_tokens", type=int, default=1024,
+                    help="Maximum generation tokens for lm-eval.")
     ap.add_argument("--dispersion", type=str, default=None, help="Dispersion loss.")
     ap.add_argument("--dispersion_coeff", type=float, default=1, help="Dispersion loss weight.")
-    ap.add_argument("--dispersion_loc", type=str, default="all", choices=["all", "last", "early_half", "late_half"])
+    ap.add_argument("--dispersion_loc", type=str, default='all',
+                    choices=["all", "last", "early_half", "late_half"],
+                    help="Dispersion loss location.")
     ap.add_argument("--tau_l2", type=float, default=1.0, help="Temperature.")
     ap.add_argument("--tau_cos", type=float, default=1.0, help="Temperature.")
-    ap.add_argument("--clamp_threshold", type=float, default=0.1, help="Clamp threshold.")
-    ap.add_argument("--sfa_ce", action="store_true",
-                    help="Enable Version C: auxiliary CE on SFA-perturbed final hidden states.")
-    ap.add_argument("--sfa_ce_coeff", type=float, default=0.1,
-                    help="Weight for auxiliary SFA-CE loss.")
-    ap.add_argument("--sfa_ce_loc", type=str, default="last",
+    ap.add_argument("--clamp_threshold", type=float, default=100.0,
+                    help="Reserved compatibility option for GPT2 SFA-Peak scripts.")
+    ap.add_argument("--sfa_peak", action="store_true",
+                    help="Enable SFA-Peak: penalize dominant spectral direction energy ratio.")
+    ap.add_argument("--sfa_peak_coeff", type=float, default=0.05,
+                    help="Weight for SFA-Peak spectral loss.")
+    ap.add_argument("--sfa_peak_loc", type=str, default="last",
                     choices=["all", "last", "early_half", "late_half"],
-                    help="Transformer layer region where SFA-CE is applied.")
-    ap.add_argument("--sfa_strength", type=float, default=0.1,
-                    help="Strength alpha for suppressing the dominant spectral direction.")
-    ap.add_argument("--sfa_iterations", type=int, default=1,
-                    help="Incomplete power-iteration steps for estimating the SFA direction.")
+                    help="Transformer layer region where SFA-Peak is applied.")
+    ap.add_argument("--sfa_peak_iterations", type=int, default=2,
+                    help="Power iterations for approximate top spectral direction.")
     ap.add_argument("--sfa_token_sample", type=int, default=128,
-                    help="Number of valid tokens sampled to estimate the dominant direction; <=0 uses all valid tokens.")
-    ap.add_argument("--sfa_rescale_norm", action="store_true",
-                    help="Rescale SFA hidden states to preserve the original Frobenius norm.")
+                    help="Valid prediction tokens sampled per sequence for SFA-Peak. <=0 uses all valid tokens.")
+    ap.add_argument("--sfa_normalize_rows", action="store_true", default=True,
+                    help="Row-normalize hidden tokens before SFA-Peak.")
+    ap.add_argument("--no_sfa_normalize_rows", dest="sfa_normalize_rows", action="store_false",
+                    help="Disable row normalization before SFA-Peak.")
     ap.add_argument("--sfa_epsilon", type=float, default=1e-6,
-                    help="Numerical stability epsilon for SFA.")
-    ap.add_argument("--num_fewshot", type=int, default=1, help="Eval num_fewshot.")
-    ap.add_argument("--max_eval_samples", type=int, default=500, help="Eval max_eval_samples.")
+                    help="Numerical epsilon for SFA-Peak.")
+    ap.add_argument("--num_fewshot", type=int, default=5, help="Eval num_fewshot.")
+    ap.add_argument("--max_eval_samples", type=int, default=200, help="Eval max_eval_samples.")
     ap.add_argument("--num_ckpt", type=int, default=5, help="Number of checkpoints.")
     ap.add_argument("--no_save_model", action="store_true")
     ap.add_argument("--num_workers", type=int, default=8, help="Number of dataloader workers.")
-    ap.add_argument("--per_device_train_batch_size", type=int, default=16)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=32)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--eval_at_begin", action="store_true", help="lm-eval at step 0 (slow on random init).")
 
     args = ap.parse_args()
 
     lora_suffix = "_lora" if args.lora else ""
+    model_str = args.model_name.replace('/', '-')
     sfa_tag = (
-        f"sface-{args.sfa_ce_coeff}-k{args.sfa_iterations}-alpha{args.sfa_strength}-sample{args.sfa_token_sample}"
-        if args.sfa_ce
-        else "sface-None"
+        f"sfapeak-{args.sfa_peak_coeff}-{args.sfa_peak_loc}-k{args.sfa_peak_iterations}-sample{args.sfa_token_sample}"
+        if args.sfa_peak
+        else "sfapeak-None"
     )
-    if args.sfa_ce and args.sfa_ce_loc != "last":
-        sfa_tag += f"-{args.sfa_ce_loc}"
-    if args.sfa_rescale_norm and args.sfa_ce:
-        sfa_tag += "-rescale"
-    args.output_dir = f'./results/midtrain_{args.model_name}{lora_suffix}_{"-".join(args.dataset_name.split("/"))}_lr-{args.lr}_token-{args.train_tokens}_disp-{args.dispersion}-{args.dispersion_coeff}-{args.dispersion_loc}-tau_cos-{args.tau_cos}-tau_l2-{args.tau_l2}_{sfa_tag}_fewshot-{args.num_fewshot}_maxsample-{args.max_eval_samples}_seed-{args.seed}'
+    args.output_dir = f'./results/midtrain_{model_str}{lora_suffix}_{"-".join(args.dataset_name.split("/"))}_lr-{args.lr}_token-{args.train_tokens}_ctx-{args.context_len}_disp-{args.dispersion}-{args.dispersion_coeff}-{args.dispersion_loc}-tau_cos-{args.tau_cos}-tau_l2-{args.tau_l2}_{sfa_tag}_fewshot-{args.num_fewshot}_maxsample-{args.max_eval_samples}_seed-{args.seed}'
     args.log_path = os.path.join(args.output_dir, 'log.txt')
     main(args)

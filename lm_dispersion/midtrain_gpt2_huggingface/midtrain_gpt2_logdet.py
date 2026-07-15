@@ -1,10 +1,9 @@
 """
-Mid-train GPT-2 with Version C SFA-CE.
+Mid-train GPT-2 with LogDet Spectral Dispersion.
 
 This script keeps the normal causal-LM forward path unchanged. During training
-only, it computes an auxiliary CE loss from final hidden states after suppressing
-their dominant spectral direction with one-step incomplete power iteration.
-Inference and lm-eval use the unmodified model.
+only, it adds a log-determinant spectral loss that maximizes the volume spanned
+by normalized token hidden states. Inference and lm-eval use the unmodified model.
 """
 
 from typing import List, Optional
@@ -321,14 +320,13 @@ class CustomLossTrainer(Trainer):
                  tau_l2: float,
                  tau_cos: float,
                  clamp_threshold: float,
-                 sfa_ce: bool,
-                 sfa_ce_coeff: float,
-                 sfa_ce_loc: str,
-                 sfa_strength: float,
-                 sfa_iterations: int,
-                 sfa_token_sample: int,
-                 sfa_rescale_norm: bool,
-                 sfa_epsilon: float,
+                 logdet: bool,
+                 logdet_coeff: float,
+                 logdet_loc: str,
+                 logdet_gamma: float,
+                 logdet_token_sample: int,
+                 logdet_normalize_rows: bool,
+                 logdet_epsilon: float,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.loss_fn = loss_fn
@@ -344,110 +342,87 @@ class CustomLossTrainer(Trainer):
                                                tau_cos=tau_cos,
                                                clamp_threshold=clamp_threshold)
 
-        self.use_sfa_ce = bool(sfa_ce) and sfa_ce_coeff > 0.0
-        self.sfa_ce_coeff = float(sfa_ce_coeff)
-        self.sfa_ce_loc = sfa_ce_loc
-        self.sfa_strength = float(sfa_strength)
-        self.sfa_iterations = int(sfa_iterations)
-        self.sfa_token_sample = int(sfa_token_sample)
-        self.sfa_rescale_norm = bool(sfa_rescale_norm)
-        self.sfa_epsilon = float(sfa_epsilon)
+        self.use_logdet = bool(logdet) and logdet_coeff > 0.0
+        self.logdet_coeff = float(logdet_coeff)
+        self.logdet_loc = logdet_loc
+        self.logdet_gamma = float(logdet_gamma)
+        self.logdet_token_sample = int(logdet_token_sample)
+        self.logdet_normalize_rows = bool(logdet_normalize_rows)
+        self.logdet_epsilon = float(logdet_epsilon)
 
     @staticmethod
     def _unwrap_model(model):
         return model.module if hasattr(model, "module") else model
 
-    def _apply_sfa_to_hidden(
+    def _valid_prediction_mask(
         self,
         hidden: torch.Tensor,
         labels: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Version C: estimate one dominant spectral direction from row-normalized
-        hidden states, then suppress that direction in the raw hidden states.
-        The auxiliary CE is computed on the full SFA-perturbed hidden states.
-        """
-        if self.sfa_strength == 0.0 or hidden.size(-1) < 2:
-            return hidden
-
         bsz, seq_len, dim = hidden.shape
-        flat_hidden = hidden.reshape(bsz * seq_len, dim)
-
         if attention_mask is not None:
             valid = attention_mask.to(device=hidden.device).bool()
         else:
             valid = torch.ones(bsz, seq_len, device=hidden.device, dtype=torch.bool)
         if labels is not None:
             # Causal LM uses hidden[:, :-1] to predict labels[:, 1:].
-            # Estimate the SFA direction from hidden positions that actually
-            # contribute to the auxiliary CE loss.
+            # Estimate the spectral direction from hidden positions that
+            # actually contribute to the causal LM loss.
             valid = valid.clone()
             valid[:, :-1] = valid[:, :-1] & labels[:, 1:].ne(-100).to(device=hidden.device)
             valid[:, -1] = False
-        valid = valid.reshape(-1)
+        return valid
 
-        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
-        if valid_idx.numel() < 2:
-            return hidden
+    def _logdet_loss_one_layer(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Maximize the normalized log-volume of each sequence:
+        -logdet(I + gamma * H H^T) / N, where H is usually row-normalized
+        valid prediction hidden states. Lower loss means higher spectral volume.
+        """
+        if hidden.size(-1) < 1:
+            return hidden.new_zeros(())
 
-        if self.sfa_token_sample > 0 and valid_idx.numel() > self.sfa_token_sample:
-            perm = torch.randperm(valid_idx.numel(), device=hidden.device)[: self.sfa_token_sample]
-            power_idx = valid_idx[perm]
-        else:
-            power_idx = valid_idx
+        valid = self._valid_prediction_mask(hidden, labels, attention_mask)
+        seq_losses = []
 
-        power_hidden = flat_hidden.index_select(0, power_idx).float()
-        power_hidden = torch.nn.functional.normalize(power_hidden, p=2, dim=-1, eps=self.sfa_epsilon)
+        for seq_hidden, seq_valid in zip(hidden, valid):
+            idx = torch.nonzero(seq_valid, as_tuple=False).flatten()
+            if idx.numel() < 2:
+                continue
 
-        r = torch.randn(dim, device=hidden.device, dtype=power_hidden.dtype)
-        for _ in range(max(0, self.sfa_iterations)):
-            hr = torch.matmul(power_hidden, r)
-            r = torch.matmul(power_hidden.transpose(0, 1), hr)
+            if self.logdet_token_sample > 0 and idx.numel() > self.logdet_token_sample:
+                perm = torch.randperm(idx.numel(), device=hidden.device)[: self.logdet_token_sample]
+                idx = idx[perm]
 
-        norm_sq = r.pow(2).sum().clamp_min(self.sfa_epsilon)
-        flat_float = flat_hidden.float()
-        projection = torch.matmul(flat_float, r).unsqueeze(-1) * (r / norm_sq).unsqueeze(0)
-        sfa_flat = flat_float - self.sfa_strength * projection
+            h = seq_hidden.index_select(0, idx).float()
+            if self.logdet_normalize_rows:
+                h = torch.nn.functional.normalize(h, p=2, dim=-1, eps=self.logdet_epsilon)
 
-        if self.sfa_rescale_norm:
-            old_norm = flat_float.norm(p="fro").clamp_min(self.sfa_epsilon)
-            new_norm = sfa_flat.norm(p="fro").clamp_min(self.sfa_epsilon)
-            sfa_flat = sfa_flat * (old_norm / new_norm)
+            n_tokens = h.size(0)
+            # Implements: L_logdet = -(1 / N) * log det(I + gamma * H H^T).
+            gram = torch.matmul(h, h.transpose(0, 1))
+            eye = torch.eye(n_tokens, device=h.device, dtype=h.dtype)
+            mat = eye + self.logdet_gamma * gram
+            mat = mat + self.logdet_epsilon * eye
 
-        return sfa_flat.to(dtype=hidden.dtype).reshape_as(hidden)
+            try:
+                chol = torch.linalg.cholesky(mat)
+                logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum()
+            except RuntimeError:
+                sign, logabsdet = torch.linalg.slogdet(mat)
+                logdet = torch.where(sign > 0, logabsdet, h.new_zeros(()))
 
-    def select_sfa_ce_hidden_states(self, hidden_states: List[torch.Tensor]) -> List[torch.Tensor]:
-        loc = self.sfa_ce_loc.lower()
-        if loc == "last":
-            return [hidden_states[-1]]
+            seq_losses.append(-logdet / float(n_tokens))
 
-        assert len(hidden_states) > 1
-        tr_indices = list(range(1, len(hidden_states)))
-        n_tr = len(tr_indices)
-        mid = n_tr // 2
-
-        if loc == "early_half":
-            sel = tr_indices[:mid] if mid > 0 else tr_indices[:1]
-        elif loc == "late_half":
-            sel = tr_indices[mid:] if mid < n_tr else tr_indices[-1:]
-        else:
-            sel = tr_indices
-
-        return [hidden_states[i] for i in sel]
-
-    def _lm_head_logits(self, model, hidden: torch.Tensor) -> torch.Tensor:
-        m = self._unwrap_model(model)
-        lm_head = m.get_output_embeddings()
-        if lm_head is None:
-            lm_head = getattr(m, "lm_head", None)
-        if lm_head is None:
-            raise ValueError("Cannot find LM head via get_output_embeddings() or model.lm_head.")
-        logits = lm_head(hidden)
-        final_bias = getattr(m, "final_logits_bias", None)
-        if final_bias is not None:
-            logits = logits + final_bias
-        return logits
+        if not seq_losses:
+            return hidden.new_zeros(())
+        return torch.stack(seq_losses).mean().to(dtype=hidden.dtype)
 
     def disperse_hidden_states(self, hidden_states: List[torch.Tensor]) -> torch.Tensor:
         '''
@@ -477,13 +452,41 @@ class CustomLossTrainer(Trainer):
         loss_values = [self.disp_loss_fn(hidden_states[i]) for i in sel]
         return torch.stack(loss_values).mean()
 
+    def logdet_hidden_states(
+        self,
+        hidden_states: List[torch.Tensor],
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        loc = self.logdet_loc.lower()
+        if loc == "last":
+            return self._logdet_loss_one_layer(hidden_states[-1], labels, attention_mask)
+
+        assert len(hidden_states) > 1
+        tr_indices = list(range(1, len(hidden_states)))
+        n_tr = len(tr_indices)
+        mid = n_tr // 2
+
+        if loc == "early_half":
+            sel = tr_indices[:mid] if mid > 0 else tr_indices[:1]
+        elif loc == "late_half":
+            sel = tr_indices[mid:] if mid < n_tr else tr_indices[-1:]
+        else:
+            sel = tr_indices
+
+        loss_values = [
+            self._logdet_loss_one_layer(hidden_states[i], labels, attention_mask)
+            for i in sel
+        ]
+        return torch.stack(loss_values).mean()
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs["labels"]
 
         # Hidden states are needed only for training-time geometry objectives.
         want_disp = self.use_disp and model.training
-        want_sfa_ce = self.use_sfa_ce and model.training
-        want_hidden = want_disp or want_sfa_ce
+        want_logdet = self.use_logdet and model.training
+        want_hidden = want_disp or want_logdet
         outputs = model(**inputs, output_hidden_states=want_hidden)
         logits = outputs.logits
 
@@ -498,21 +501,16 @@ class CustomLossTrainer(Trainer):
         else:
             disp_loss = torch.zeros_like(default_loss)
 
-        if want_sfa_ce:
-            sfa_ce_losses = []
-            for hidden in self.select_sfa_ce_hidden_states(outputs.hidden_states):
-                z_sfa = self._apply_sfa_to_hidden(
-                    hidden,
-                    labels=labels,
-                    attention_mask=inputs.get("attention_mask"),
-                )
-                sfa_logits = self._lm_head_logits(model, z_sfa)
-                sfa_ce_losses.append(self.loss_fn(sfa_logits, labels))
-            sfa_ce_loss = torch.stack(sfa_ce_losses).mean()
-            total_loss = total_loss + self.sfa_ce_coeff * sfa_ce_loss
-            outputs.sfa_ce_loss = sfa_ce_loss.detach()
+        if want_logdet:
+            logdet_loss = self.logdet_hidden_states(
+                outputs.hidden_states,
+                labels=labels,
+                attention_mask=inputs.get("attention_mask"),
+            )
+            total_loss = total_loss + self.logdet_coeff * logdet_loss
+            outputs.logdet_loss = logdet_loss.detach()
         else:
-            sfa_ce_loss = torch.zeros_like(default_loss)
+            logdet_loss = torch.zeros_like(default_loss)
 
         if (model.training and
             self.state.global_step > 0 and
@@ -520,7 +518,7 @@ class CustomLossTrainer(Trainer):
 
             custom_losses = {
                 "train/dispersion_loss": disp_loss.detach().item(),
-                "train/sfa_ce_loss": sfa_ce_loss.detach().item(),
+                "train/logdet_loss": logdet_loss.detach().item(),
                 "train/default_loss": default_loss.detach().item(),
                 "train/total_loss": total_loss.detach().item(),
             }
@@ -644,14 +642,13 @@ def main(args):
         tau_cos=args.tau_cos,
         tau_l2=args.tau_l2,
         clamp_threshold=args.clamp_threshold,
-        sfa_ce=args.sfa_ce,
-        sfa_ce_coeff=args.sfa_ce_coeff,
-        sfa_ce_loc=args.sfa_ce_loc,
-        sfa_strength=args.sfa_strength,
-        sfa_iterations=args.sfa_iterations,
-        sfa_token_sample=args.sfa_token_sample,
-        sfa_rescale_norm=args.sfa_rescale_norm,
-        sfa_epsilon=args.sfa_epsilon,
+        logdet=args.logdet,
+        logdet_coeff=args.logdet_coeff,
+        logdet_loc=args.logdet_loc,
+        logdet_gamma=args.logdet_gamma,
+        logdet_token_sample=args.logdet_token_sample,
+        logdet_normalize_rows=args.logdet_normalize_rows,
+        logdet_epsilon=args.logdet_epsilon,
         train_dataset=lm_train,
         eval_dataset=lm_val,
         processing_class=tokenizer,
@@ -668,9 +665,9 @@ def main(args):
     log(f"Token budget: {args.train_tokens} | Tokens/step: {tokens_per_step} | Max steps: {max_steps}", filepath=args.log_path)
     log(f"Precision: {'bf16' if bf16 else ('fp16' if fp16 else 'fp32')}", filepath=args.log_path)
     log(
-        f"SFA-CE: enabled={args.sfa_ce} | coeff={args.sfa_ce_coeff} | "
-        f"loc={args.sfa_ce_loc} | k={args.sfa_iterations} | strength={args.sfa_strength} | "
-        f"token_sample={args.sfa_token_sample} | rescale_norm={args.sfa_rescale_norm}",
+        f"LogDet: enabled={args.logdet} | coeff={args.logdet_coeff} | "
+        f"loc={args.logdet_loc} | gamma={args.logdet_gamma} | "
+        f"token_sample={args.logdet_token_sample} | normalize_rows={args.logdet_normalize_rows}",
         filepath=args.log_path,
     )
 
@@ -738,7 +735,7 @@ def main(args):
     log(f"Done. Saved to {args.output_dir}", filepath=args.log_path)
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Mid-train GPT-2 with Version C SFA-CE auxiliary loss.")
+    ap = argparse.ArgumentParser(description="Mid-train GPT-2 with LogDet Spectral Dispersion loss.")
     ap.add_argument("--model_name", type=str, default="gpt2",
                     help="Hugging Face model id to start from (pretrained).")
     ap.add_argument("--lora", action="store_true", help="Use LoRA (Low-Rank Adaptation) instead of full fine-tuning")
@@ -759,23 +756,23 @@ if __name__ == "__main__":
     ap.add_argument("--tau_l2", type=float, default=1.0, help="Temperature.")
     ap.add_argument("--tau_cos", type=float, default=1.0, help="Temperature.")
     ap.add_argument("--clamp_threshold", type=float, default=0.1, help="Clamp threshold.")
-    ap.add_argument("--sfa_ce", action="store_true",
-                    help="Enable Version C: auxiliary CE on SFA-perturbed final hidden states.")
-    ap.add_argument("--sfa_ce_coeff", type=float, default=0.1,
-                    help="Weight for auxiliary SFA-CE loss.")
-    ap.add_argument("--sfa_ce_loc", type=str, default="last",
+    ap.add_argument("--logdet", action="store_true",
+                    help="Enable LogDet Spectral Dispersion: maximize hidden-state log-volume.")
+    ap.add_argument("--logdet_coeff", type=float, default=0.01,
+                    help="Weight for LogDet spectral loss. The loss itself is negative logdet/N.")
+    ap.add_argument("--logdet_loc", type=str, default="last",
                     choices=["all", "last", "early_half", "late_half"],
-                    help="Transformer layer region where SFA-CE is applied.")
-    ap.add_argument("--sfa_strength", type=float, default=0.1,
-                    help="Strength alpha for suppressing the dominant spectral direction.")
-    ap.add_argument("--sfa_iterations", type=int, default=1,
-                    help="Incomplete power-iteration steps for estimating the SFA direction.")
-    ap.add_argument("--sfa_token_sample", type=int, default=128,
-                    help="Number of valid tokens sampled to estimate the dominant direction; <=0 uses all valid tokens.")
-    ap.add_argument("--sfa_rescale_norm", action="store_true",
-                    help="Rescale SFA hidden states to preserve the original Frobenius norm.")
-    ap.add_argument("--sfa_epsilon", type=float, default=1e-6,
-                    help="Numerical stability epsilon for SFA.")
+                    help="Transformer layer region where LogDet is applied.")
+    ap.add_argument("--logdet_gamma", type=float, default=1.0,
+                    help="Spectral scale inside logdet(I + gamma * H H^T).")
+    ap.add_argument("--logdet_token_sample", type=int, default=128,
+                    help="Number of valid tokens sampled for LogDet; <=0 uses all valid tokens.")
+    ap.add_argument("--logdet_normalize_rows", action="store_true", default=True,
+                    help="Row-normalize hidden states before computing LogDet.")
+    ap.add_argument("--no_logdet_normalize_rows", action="store_false", dest="logdet_normalize_rows",
+                    help="Compute LogDet on raw hidden states instead of row-normalized directions.")
+    ap.add_argument("--logdet_epsilon", type=float, default=1e-6,
+                    help="Numerical stability epsilon for LogDet.")
     ap.add_argument("--num_fewshot", type=int, default=1, help="Eval num_fewshot.")
     ap.add_argument("--max_eval_samples", type=int, default=500, help="Eval max_eval_samples.")
     ap.add_argument("--num_ckpt", type=int, default=5, help="Number of checkpoints.")
@@ -789,15 +786,13 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     lora_suffix = "_lora" if args.lora else ""
-    sfa_tag = (
-        f"sface-{args.sfa_ce_coeff}-k{args.sfa_iterations}-alpha{args.sfa_strength}-sample{args.sfa_token_sample}"
-        if args.sfa_ce
-        else "sface-None"
+    logdet_tag = (
+        f"logdet-{args.logdet_coeff}-{args.logdet_loc}-gamma{args.logdet_gamma}-sample{args.logdet_token_sample}"
+        if args.logdet
+        else "logdet-None"
     )
-    if args.sfa_ce and args.sfa_ce_loc != "last":
-        sfa_tag += f"-{args.sfa_ce_loc}"
-    if args.sfa_rescale_norm and args.sfa_ce:
-        sfa_tag += "-rescale"
-    args.output_dir = f'./results/midtrain_{args.model_name}{lora_suffix}_{"-".join(args.dataset_name.split("/"))}_lr-{args.lr}_token-{args.train_tokens}_disp-{args.dispersion}-{args.dispersion_coeff}-{args.dispersion_loc}-tau_cos-{args.tau_cos}-tau_l2-{args.tau_l2}_{sfa_tag}_fewshot-{args.num_fewshot}_maxsample-{args.max_eval_samples}_seed-{args.seed}'
+    if args.logdet and not args.logdet_normalize_rows:
+        logdet_tag += "-raw"
+    args.output_dir = f'./results/midtrain_{args.model_name}{lora_suffix}_{"-".join(args.dataset_name.split("/"))}_lr-{args.lr}_token-{args.train_tokens}_disp-{args.dispersion}-{args.dispersion_coeff}-{args.dispersion_loc}-tau_cos-{args.tau_cos}-tau_l2-{args.tau_l2}_{logdet_tag}_fewshot-{args.num_fewshot}_maxsample-{args.max_eval_samples}_seed-{args.seed}'
     args.log_path = os.path.join(args.output_dir, 'log.txt')
     main(args)

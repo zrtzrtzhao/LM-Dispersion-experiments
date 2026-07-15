@@ -1,5 +1,5 @@
 """
-Mid-train GPT-2 with Version C SFA-CE.
+Mid-train GPT-2 with Version C SFA-CE without row normalization.
 
 This script keeps the normal causal-LM forward path unchanged. During training
 only, it computes an auxiliary CE loss from final hidden states after suppressing
@@ -364,8 +364,9 @@ class CustomLossTrainer(Trainer):
         attention_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
-        Version C: estimate one dominant spectral direction from row-normalized
-        hidden states, then suppress that direction in the raw hidden states.
+        Version C no-norm ablation: estimate one dominant spectral direction
+        directly from raw hidden states, then suppress that direction in the
+        raw hidden states.
         The auxiliary CE is computed on the full SFA-perturbed hidden states.
         """
         if self.sfa_strength == 0.0 or hidden.size(-1) < 2:
@@ -398,7 +399,6 @@ class CustomLossTrainer(Trainer):
             power_idx = valid_idx
 
         power_hidden = flat_hidden.index_select(0, power_idx).float()
-        power_hidden = torch.nn.functional.normalize(power_hidden, p=2, dim=-1, eps=self.sfa_epsilon)
 
         r = torch.randn(dim, device=hidden.device, dtype=power_hidden.dtype)
         for _ in range(max(0, self.sfa_iterations)):
@@ -668,7 +668,7 @@ def main(args):
     log(f"Token budget: {args.train_tokens} | Tokens/step: {tokens_per_step} | Max steps: {max_steps}", filepath=args.log_path)
     log(f"Precision: {'bf16' if bf16 else ('fp16' if fp16 else 'fp32')}", filepath=args.log_path)
     log(
-        f"SFA-CE: enabled={args.sfa_ce} | coeff={args.sfa_ce_coeff} | "
+        f"SFA-CE no-norm: enabled={args.sfa_ce} | coeff={args.sfa_ce_coeff} | "
         f"loc={args.sfa_ce_loc} | k={args.sfa_iterations} | strength={args.sfa_strength} | "
         f"token_sample={args.sfa_token_sample} | rescale_norm={args.sfa_rescale_norm}",
         filepath=args.log_path,
@@ -738,7 +738,7 @@ def main(args):
     log(f"Done. Saved to {args.output_dir}", filepath=args.log_path)
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Mid-train GPT-2 with Version C SFA-CE auxiliary loss.")
+    ap = argparse.ArgumentParser(description="Mid-train GPT-2 with Version C SFA-CE auxiliary loss without row normalization.")
     ap.add_argument("--model_name", type=str, default="gpt2",
                     help="Hugging Face model id to start from (pretrained).")
     ap.add_argument("--lora", action="store_true", help="Use LoRA (Low-Rank Adaptation) instead of full fine-tuning")
@@ -790,7 +790,7 @@ if __name__ == "__main__":
 
     lora_suffix = "_lora" if args.lora else ""
     sfa_tag = (
-        f"sface-{args.sfa_ce_coeff}-k{args.sfa_iterations}-alpha{args.sfa_strength}-sample{args.sfa_token_sample}"
+        f"sface-nonorm-{args.sfa_ce_coeff}-k{args.sfa_iterations}-alpha{args.sfa_strength}-sample{args.sfa_token_sample}"
         if args.sfa_ce
         else "sface-None"
     )
